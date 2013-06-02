@@ -30,6 +30,7 @@ probe begin
       inode_lba_val = $5
       error_type = 1
       access_type = 2
+      timeout_flag = 0
 }
 
 probe end
