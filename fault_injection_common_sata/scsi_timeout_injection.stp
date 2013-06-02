@@ -72,34 +72,4 @@ function save_entry_next:long (cmd:long)
 %}
 
 
-probe module("*").function("scsi_delete_timer@drivers/scsi/scsi_error.c") {
 
-        if(global_scmd == $scmd)
-        {
-                startsite = save_start_site($scmd)
-                entrynext = save_entry_next($scmd)
-                printf(" scsi_delete_timer: scmd= %d, startsite= %d, next=  %d \n",  $scmd, startsit, entrynext)
-        }
-}
-
-probe module("*").function("scsi_delete_timer@drivers/scsi/scsi_error.c").return {
-
-        if(global_scmd == $scmd)
-        {
-                 result = restore_val($scmd, entrynext, startsite, timeoutfunction, restore_state)
-  printf(" scsi_delete_timer: return= %d, scmd= %d global_scmd= %d result= %d \n", $return, $scmd, global_scmd, result)
-                 target_access_t = 0
-                 global_scmd = 0
-                 restore_state = 0
-        }
-}
-
-probe module("*").statement("scsi_add_timer@drivers/scsi/scsi_error.c") 
-{
-        if((target_access_t != 0) && (global_scmd == $scmd))
-        {
-                 timeoutfunction = $complete
-                 $timeout = timeout_period
-                 printf("\n scsi_add_timer: inode= %d, scmd= %d, timeout= %d, delete_timer_block= %d, timeoutfinction= %d \n", inode, $scmd, $timeout, delete_timer_block, timeoutfunction)
-        }
-}
