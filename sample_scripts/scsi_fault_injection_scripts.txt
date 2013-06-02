@@ -1,0 +1,6 @@
+read	temporary_rerr.stp
+read	disk_rerr.stp
+read	sector_rerr.stp
+read	disk_rwerr.stp
+write	temporary_werr.stp
+

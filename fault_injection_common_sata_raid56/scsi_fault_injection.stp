@@ -1,0 +1,308 @@
+#! /usr/bin/env stap
+
+#  SCSI fault injection library using SystemTap
+#  Copyright (C) 2007 NEC Corporation
+#  Copyright(c) Information-technology Promotion Agency, Japan. All rights reserved 2007.
+#  Result of Open Source Software Development Activities of
+#  Information-technology Promotion Agency, Japan.
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+#
+
+%{
+#include <linux/types.h>
+#include <scsi/scsi_cmnd.h>
+#include <scsi/scsi_device.h>
+#include <linux/timer.h>
+#include <linux/blkdev.h>
+#include <linux/bio.h>
+#include <linux/mm_types.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/raid/raid5.h>
+%}
+
+global target_access
+global target_scmd
+global target_rq
+global target_bio
+global target_block
+global fix_write
+global temp_failure
+
+global error_type
+global access_type
+global dev_major
+global dev_minor_min
+global dev_minor_max
+global inode_lba_flag
+global inode_lba_val
+global timeout_flag
+global retry_allowed
+global target_minor
+
+global orig_bio
+global orig_sector
+global global_shsector
+
+
+probe begin 
+{
+        orig_sector = -1
+        global_shsector = -1
+        target_block = -1
+        target_minor = -1
+        printf("\nBEGIN\n")
+}
+
+
+function set_sense_buf:long (cmd:long, result:long, sensekey:long, asc:long, ascq:long )
+%{
+        struct scsi_cmnd * scmd = (struct scsi_cmnd *)(long)THIS->cmd;
+
+        scmd->result = (int)(long)THIS->result; 
+        scmd->sense_buffer[0] = 0x70; /* current, fixed format */
+        scmd->sense_buffer[2] = (unsigned char)(long)THIS->sensekey;
+        scmd->sense_buffer[7] = 0x13; /* length */
+        scmd->sense_buffer[12] = (unsigned char)(long)THIS->asc;
+        scmd->sense_buffer[13] = (unsigned char)(long)THIS->ascq;
+%}
+
+function get_inode:long (page:long)
+%{
+        struct page * thispage = (struct page *)(long)THIS->page;
+        unsigned long tempval = (unsigned long)thispage->flags;
+	struct address_space *mapping = thispage->mapping;
+
+	if (unlikely(PageSwapCache(thispage)))
+		mapping = NULL;
+#ifdef CONFIG_SLUB
+	else if (unlikely(PageSlab(thispage)))
+		mapping = NULL;
+#endif
+	else if (unlikely((unsigned long)mapping & PAGE_MAPPING_ANON))
+		mapping = NULL;
+
+        if((mapping != NULL) && (mapping->host != NULL))
+        {
+                THIS->__retvalue = (unsigned long)(mapping->host->i_ino);
+        } else {
+                THIS->__retvalue = 0;
+        }
+%}
+
+probe module("*").function("make_request@drivers/md/raid5.c") 
+{
+        if(target_block == -1)
+        {
+               page = $bi->bi_io_vec->bv_page
+               if(page != 0)
+               {
+                       inode = get_inode(page)
+               }
+        }
+
+        if((target_block == -1)&&(inode_lba_flag ==1)&&(inode == inode_lba_val))
+        {
+                orig_bio = $bi
+                orig_sector = $bi->bi_sector
+        }
+}
+
+probe module("*").function("add_stripe_bio@drivers/md/raid5.c")
+{
+        if((target_block == -1)&&(orig_bio == $bi)&&(orig_sector == $bi->bi_sector))
+        {
+                global_shsector = $sh->sector
+        }
+}
+
+probe kernel.function("generic_make_request") 
+{
+        major = $bio->bi_bdev->bd_disk->major
+        minor = $bio->bi_bdev->bd_disk->first_minor
+        direction = ($bio->bi_rw)
+        sector = $bio->bi_sector
+
+        if((target_block == -1)&&(global_shsector == $bio->bi_sector)&&((access_type & 0x01)==(direction & 0x01)||access_type==3))
+        {
+                if((target_minor== -1) && (major == dev_major) && ((dev_minor_min & 0xfff0) <= minor) && (minor <= (dev_minor_max & 0xfff0)))
+                {
+                        target_minor= minor
+                        target_bio = $bio
+                }
+        }
+}
+
+probe module("*").function("scsi_decide_disposition@drivers/scsi/scsi_error.c")
+{
+        scmd_direction = $scmd->sc_data_direction 
+
+        if((((temp_failure == 1) || (error_type == 1)) && (target_scmd == $scmd)) && ((scmd_direction == access_type) || (access_type == 3) || ((scmd_direction == 2) && (access_type== 4))) && ($scmd->request->rq_disk != 0))
+        {
+                major = $scmd->request->rq_disk->major
+                minor = $scmd->request->rq_disk->first_minor
+                block = $scmd->request->sector
+                req_len = $scmd->request_bufflen
+
+                if(major == dev_major && minor == target_minor && ((block == target_block) || ((block <= target_block) && (target_block < block + (req_len >> 9)))))
+                {
+                        if((scmd_direction == 2) && (fix_write == 2))
+                        { 
+                                #fix_write = 0
+                        } else 
+                        {
+                                printf("scsi_decide_disposition : major=%d minor=%d scmd=%d \n",major, minor, $scmd)
+                                /* create fake status and sense data */
+                                temp_failure++
+                                set_sense_buf($scmd, 0x02, 0x03, 0x11, 0x04)
+                        }
+                }
+        }
+}
+
+probe module("*").function("scsi_next_command@drivers/scsi/scsi_lib.c") 
+{
+        if((target_access != 0) && (target_scmd == $cmd))
+        {
+              printf("scsi_next_command : cmd = %d  \n", $cmd)
+              target_access = 0
+              target_scmd = 0
+              target_rq = 0
+              restore_state = 0
+        }
+}
+
+probe module("*").function("scsi_dispatch_cmd@drivers/scsi/scsi.c") 
+{
+        struct_bio= $cmd->request->bio
+        block = $cmd->request->sector
+        req_len = $cmd->request_bufflen
+
+        if($cmd->request->rq_disk != 0)
+        {  
+                major = $cmd->request->rq_disk->major
+                minor = $cmd->request->rq_disk->first_minor
+        }
+
+        if((target_block == -1) && (target_bio == struct_bio) && (target_minor == minor))
+        {
+                target_block = block
+        }
+
+        if(target_block == -1)
+        {
+                if(struct_bio != 0)
+                {
+                        page = $cmd->request->bio->bi_io_vec->bv_page
+                        if(page != 0)
+                        {
+                                inode = get_inode(page)
+                        }
+                }
+        }
+
+        if(((inode_lba_flag ==1)&&(inode == inode_lba_val)) || ((inode_lba_flag ==0 ) && ((block <= inode_lba_val) && (inode_lba_val < block + (req_len >> 9)))) || (block == target_block) || ((block <= target_block) && (target_block < block + (req_len >> 9))))
+        {
+                printf("\nSCSI_DISPATCH_CMD: command= %d  \n", $cmd->cmnd[0])
+                printf("SCSI_DISPATCH_CMD: major= %d minor= %d \n", major, minor)
+                printf("SCSI_DISPATCH_CMD: flag(0:LBA, 1:inode)= %d \n", inode_lba_flag)
+                printf("SCSI_DISPATCH_CMD: start sector= %d \n", $cmd->request->sector)
+                printf("SCSI_DISPATCH_CMD: req bufflen= %d \n", $cmd->request_bufflen)
+                printf("SCSI_DISPATCH_CMD: inode= %d \n", inode)
+                printf("SCSI_DISPATCH_CMD: scmd = %d \n", $cmd)
+                printf("SCSI_DISPATCH_CMD: [7]=%d [8]=%d \n", $cmd->cmnd[7],$cmd->cmnd[8])
+
+                if((target_minor== -1) && (major == dev_major) && ((dev_minor_min & 0xfff0) <= minor) && (minor <= (dev_minor_max & 0xfff0)))
+                {
+                        tmp_minor = minor
+                }
+
+                if((major == dev_major && ((minor == tmp_minor) || (minor == target_minor))) && (fix_write != 2))
+                {
+                        /* inject errors on the designated device */
+                        printf("SCSI_DISPATCH_CMD: cmd-retries = %d entire-retry =%d \n", $cmd->retries, entire_retries)
+                        cmd_direction = $cmd->sc_data_direction
+                        if((cmd_direction == 1) && (access_type == 4))
+                        {
+                                fix_write = 2
+                                printf("SCSI_DISPATCH_CMD: fix_write =%d \n", fix_write)
+                        }
+
+                        if((temp_failure == 0) || (error_type == 1) ||((timeout_flag == 1) && (entire_retries < 1)))
+                        {
+                                if((cmd_direction == access_type) || ((cmd_direction == 2) && (access_type == 4)) || (access_type == 3))
+                                {
+                                        if(target_minor == -1)
+                                        {
+                                                target_minor = tmp_minor
+                                        }
+
+                                        if(target_block == -1)
+                                        {
+                                                target_block = block
+                                        }
+
+                                        if(target_access == 0)
+                                        {
+                                                target_bio = struct_bio
+                                                retry_allowed = $cmd->allowed
+                                                target_access++
+                                                target_scmd = $cmd
+                                                target_rq = $cmd->request
+                                        }
+
+                                        temp_failure++
+
+                                        if(($cmd->cmnd[0] == 0x28) || ($cmd->cmnd[0] == 0x2a))
+                                        {
+                                                /* read_10 or write_10 */
+                                                $cmd->cmnd[7]=0
+                                                $cmd->cmnd[8]=0
+                                        }else if(($cmd->cmnd[0] == 0x08) || ($cmd->cmnd[0] == 0x0a))
+                                        {
+                                                /* read_16 or write_16 */
+                                                $cmd->cmnd[10]=0
+                                                $cmd->cmnd[11]=0
+                                                $cmd->cmnd[12]=0
+                                                $cmd->cmnd[13]=0
+                                        }else if(($cmd->cmnd[0] == 0x08) || ($cmd->cmnd[0] == 0x0a))
+                                        {
+                                                /* read_6 or write_6 */
+                                                $cmd->cmnd[4]=0
+                                        }
+
+                                        if(target_scmd == $cmd)
+                                        {
+                                                entire_retries++
+                                        }
+
+                                        if((target_access_t == 0) && (timeout_flag == 1))
+                                        {
+                                                target_access_t++
+                                                global_scmd = $cmd
+                                                restore_state = $cmd->device->host->shost_state
+                                                $cmd->device->host->shost_state = 4
+                                        }
+                                }
+                        }
+
+                        printf("\nSCSI_DISPATCH_CMD: cmd= %d, allowed = %d retries= %d \n", $cmd, $cmd->allowed, $cmd->retries)
+                        printf("SCSI_DISPATCH_CMD:scsi_cmnd= %d (host,channel,id,lun)= (%d, %d, %d, %d) \n", $cmd, $cmd->device->host->host_no, $cmd->device->channel, $cmd->device->id, $cmd->device->lun)
+                        printf("SCSI_DISPATCH_CMD:execname=%s, pexecname=%s\n", execname(), pexecname())
+                }
+        }
+}
+

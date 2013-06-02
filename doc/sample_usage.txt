@@ -1,0 +1,176 @@
+
+Introduction
+------------
+This document describes sample usage of the SCSI fault injection test tool.
+As a example, how to check the error handling routine of md-raid1 in case of
+correctable read error, is shown here.
+
+
+Hardware Requirement
+--------------------
+   x86 server running Fedora 8,
+   SATA disk * 3, 
+    sda : system disk
+
+    sdb : work disk1 
+    sdb1: 2GB partition
+
+    sdc : work disk2
+    sdc1: 2GB partition
+
+
+Test md-raid1 array by injecting faults
+---------------------------------------
+
+ 1. Set up for using SystemTap on upstream kernel
+
+   1-1 Install Fedora8(x86) on /dev/sda with systemtap.
+    
+   1-2 Compile the upstream kernel with debuginfo.
+       (See Appendix A. of readme.txt)
+
+   1-3 Decompress tool set and move them to an arbitrary directory.
+       # cd /root
+       # tar -jxf scsi_fault_injection_test_tool-1.0.0.tar.bz2
+
+
+ 2. Create md raid1 array 
+
+   2-1 Create an array
+       # mdadm -C /dev/md0 -l1 n2 -f /dev/sd[bc]1
+       # cat /proc/mdstat
+        Personalities : [raid1]
+        md0 : active raid1 sdb1[0] sdc1[1]
+        1959808 blocks [2/2] [UU]
+
+
+   2-2 Create a filesystem
+       # mkfs -t ext3 /dev/md0
+
+   2-3 Mount the md device
+       # mount -t ext3 /dev/md0 /home/test
+
+ 3. Create a target file to cause a fault
+
+    3-1 Create a file
+       # cd /home/test
+       # touch test.txt
+       # echo "test file" >> test.txt
+       # ls -hil
+
+       -> We will use the test.txt to inject a fault.       
+
+    3-2 Check the inode number of the file
+
+       # ls -hil
+
+        total 28K
+            11 drwx------  2 root root  16K 2007-12-21 18:22 lost+found
+            12 -rw-r--r--  1 root root   21 2007-12-21 19:39 test.txt
+
+       -> test.text has inode 12 on the md device
+
+ 4. Drop page caches
+      
+     At this moment, test.txt is probably on the page cache. The read
+     request only to read from the cache. So, page caches needs to be 
+     dumped to generate a read access from a disk.
+
+      # echo 1 > /proc/sys/vm/drop_caches
+
+ 5. Run a script
+
+      # stap /root/scsi_fault_injection_test_tool-1.0.0/sec_rerr.stp 8 17 33 1 12 -g \
+        -I /root/scsi_fault_injection_test_tool-1.0.0/fault_injection_common_sata -v
+
+       Run sec_rerr.stp to set a hook for a correctable read error.
+       Currently, /dev/sdb and /dev/sdc consists of a md RAID1 array,
+       so give minor-min=17, minor-max=33.
+       We want to inject a fault by accessing test.txt, which is inode=12, so
+       flag=1(inode) value=12.
+       
+ 6. Wait a SystemTap to be ready
+           
+     SystemTap needs takes about 30 seconds to be ready.
+     When it get ready, "Pass 5: starting run" is shown on the screen.
+
+ 7. Access the target device
+
+     Open another console and read test.txt to inject a fault.
+
+      # cat test.txt
+      test file
+
+     The cat command seems completed as usual, but actually 
+     error handling routine works on the background.
+
+
+ 8. Check the result
+
+     The systemtap script prints the following messages on the console.
+
+       ...
+ 
+     SCSI_DISPATCH_CMD: command= 40
+     SCSI_DISPATCH_CMD: major= 8 minor= 16
+     SCSI_DISPATCH_CMD: flag(0:LBA, 1:inode)= 1
+     SCSI_DISPATCH_CMD: start sector= 2504855
+     SCSI_DISPATCH_CMD: req bufflen= 4096
+     SCSI_DISPATCH_CMD: inode= 12
+     SCSI_DISPATCH_CMD: scmd = 4122759912
+     SCSI_DISPATCH_CMD: [7]=0 [8]=8
+     SCSI_DISPATCH_CMD: cmd-retries = 0 entire-retry =0
+
+     SCSI_DISPATCH_CMD: cmd= 4122759912, allowed = 5 retries= 0
+     SCSI_DISPATCH_CMD:scsi_cmnd= 4122759912 (host,channel,id,lun)= (0, 0, 1, 0)
+     SCSI_DISPATCH_CMD:execname=cat, pexecname=bash
+     scsi_decide_disposition : major=8 minor=16 scmd=4122759912
+     scsi_next_command : cmd = 4122759912     
+       ...
+
+     SCSI_DISPATCH_CMD: command= 42
+     SCSI_DISPATCH_CMD: major= 8 minor= 16
+     SCSI_DISPATCH_CMD: flag(0:LBA, 1:inode)= 1
+     SCSI_DISPATCH_CMD: start sector= 2504855
+     SCSI_DISPATCH_CMD: req bufflen= 4096
+       ...
+
+     In the middle of the message, we can find the row begin with 
+     "scsi_decide_disposition". This means that fault is injected on
+     the read access(command= 40) to sdb(major= 8 minor= 16) start
+     with LBA=2504855, concerning test.txt(inode= 12).
+
+     Also, we can find that someone write(command= 42) to the same location
+     (major= 8 minor= 16, start sector= 2504855). Actually, it is a write 
+     access made by md-raid1 error handling routine.
+     
+     The followings are logged in the syslog.
+
+       ...
+
+     kernel: sd 0:0:1:0: [sdb] Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE,SUGGEST_OK
+     kernel: sd 0:0:1:0: [sdb] Sense Key : Medium Error [current]
+     kernel: sd 0:0:1:0: [sdb] Add. Sense: Unrecovered read error - auto reallocate failed
+     kernel: end_request: I/O error, dev sdb, sector 50825299
+     kernel: raid1:md0: read error corrected (8 sectors at 9650704 on sdb3)
+     kernel: raid1: sdc: redirecting sector 9650704 to another mirror
+       ...
+
+     We can find that a read error occurred on sdb, but corrected.
+     The md-raid1 doesn't detach anything because error on sdb is corrected.
+
+     # cat /proc/mdstat
+     Personalities : [raid1]
+     md0 : active raid1 sdb1[0] sdc1[1]
+     1959808 blocks [2/2] [UU]
+
+
+ 9. Stop the running script
+
+     The script started in step 5. is continue to running.
+     You have to stop it by hand.
+
+     # pkill stap
+     (or hit Ctrl-C)
+ 
+

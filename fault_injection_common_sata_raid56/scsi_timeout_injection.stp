@@ -1,0 +1,105 @@
+#! /usr/bin/env stap
+
+#  SCSI fault injection library using SystemTap
+#  Copyright (C) 2007 NEC Corporation
+#  Copyright(c) Information-technology Promotion Agency, Japan. All rights reserved 2007.
+#  Result of Open Source Software Development Activities of
+#  Information-technology Promotion Agency, Japan.
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+#
+
+%{
+#include <linux/types.h>
+#include <scsi/scsi_cmnd.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_host.h>
+#include <linux/timer.h>
+#include <linux/blkdev.h>
+#include <linux/bio.h>
+#include <linux/mm_types.h>
+#include <linux/fs.h>
+%}
+
+global global_scmd
+global startsite
+global entrynext
+global timeoutfunction
+global restore_state
+global target_access_t
+global entire_retries
+global timeout_period
+
+function restore_val:long (cmd:long, entrynext:long, startsite:long, func:long, hoststs:long)
+%{
+  struct scsi_cmnd * scmd = (struct scsi_cmnd *)(long)THIS->cmd;
+
+  scmd->eh_timeout.data = (unsigned long)(long)THIS->cmd;
+  scmd->eh_timeout.start_site = (void *)(long)THIS->startsite;
+  scmd->eh_timeout.function = (void (*)(unsigned long))(long)THIS->func; 
+  scmd->eh_timeout.entry.next = (void *)(long)THIS->entrynext;
+  scmd->device->host->shost_state = (int)(long)THIS->hoststs;
+  scmd->result = 0;
+
+  THIS->__retvalue = (unsigned int)scmd->result;
+%}
+
+function save_start_site:long (cmd:long)
+%{
+  struct scsi_cmnd * scmd = (struct scsi_cmnd *)(long)THIS->cmd;
+  THIS->__retvalue = (unsigned int)scmd->eh_timeout.start_site;
+%}
+
+function save_entry_next:long (cmd:long)
+%{
+  struct scsi_cmnd * scmd = (struct scsi_cmnd *)(long)THIS->cmd;
+  unsigned int tempval;
+  tempval = (unsigned int)scmd->eh_timeout.entry.next;
+  scmd->eh_timeout.entry.next = NULL;
+  THIS->__retvalue = tempval;
+%}
+
+
+probe module("*").function("scsi_delete_timer@drivers/scsi/scsi_error.c") {
+
+        if(global_scmd == $scmd)
+        {
+                startsite = save_start_site($scmd)
+                entrynext = save_entry_next($scmd)
+                printf(" scsi_delete_timer: scmd= %d, startsite= %d, next=  %d \n",  $scmd, startsit, entrynext)
+        }
+}
+
+probe module("*").function("scsi_delete_timer@drivers/scsi/scsi_error.c").return {
+
+        if(global_scmd == $scmd)
+        {
+                 result = restore_val($scmd, entrynext, startsite, timeoutfunction, restore_state)
+  printf(" scsi_delete_timer: return= %d, scmd= %d global_scmd= %d result= %d \n", $return, $scmd, global_scmd, result)
+                 target_access_t = 0
+                 global_scmd = 0
+                 restore_state = 0
+        }
+}
+
+probe module("*").statement("scsi_add_timer@drivers/scsi/scsi_error.c") 
+{
+        if((target_access_t != 0) && (global_scmd == $scmd))
+        {
+                 timeoutfunction = $complete
+                 $timeout = timeout_period
+                 printf("\n scsi_add_timer: inode= %d, scmd= %d, timeout= %d, delete_timer_block= %d, timeoutfinction= %d \n", inode, $scmd, $timeout, delete_timer_block, timeoutfunction)
+        }
+}
