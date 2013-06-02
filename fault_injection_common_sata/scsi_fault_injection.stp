@@ -106,8 +106,8 @@ probe module("*").function("scsi_decide_disposition@drivers/scsi/scsi_error.c")
         {
                 major = $scmd->request->rq_disk->major
                 minor = $scmd->request->rq_disk->first_minor
-                block = $scmd->request->sector
-                req_len = $scmd->request_bufflen
+                block = $scmd->request->__sector
+                req_len = $scmd->sdb->length
 
                 if(major == dev_major && minor == target_minor && ((block == target_block) || ((block <= target_block) && (target_block < block + (req_len >> 9)))))
                 {
@@ -140,8 +140,8 @@ probe module("*").function("scsi_next_command@drivers/scsi/scsi_lib.c")
 probe module("*").function("scsi_dispatch_cmd@drivers/scsi/scsi.c") 
 {
         struct_bio= $cmd->request->bio
-        block = $cmd->request->sector
-        req_len = $cmd->request_bufflen
+        block = $cmd->request->__sector
+        req_len = $cmd->sdb->length
 
         if($cmd->request->rq_disk != 0)
         {
@@ -166,8 +166,8 @@ probe module("*").function("scsi_dispatch_cmd@drivers/scsi/scsi.c")
                 printf("\nSCSI_DISPATCH_CMD: command= %d  \n", $cmd->cmnd[0])
                 printf("SCSI_DISPATCH_CMD: major= %d minor= %d \n", major, minor)
                 printf("SCSI_DISPATCH_CMD: flag(0:LBA, 1:inode)= %d \n", inode_lba_flag)
-                printf("SCSI_DISPATCH_CMD: start sector= %d \n", $cmd->request->sector)
-                printf("SCSI_DISPATCH_CMD: req bufflen= %d \n", $cmd->request_bufflen)
+                printf("SCSI_DISPATCH_CMD: start sector= %d \n", $cmd->request->__sector)
+                printf("SCSI_DISPATCH_CMD: req bufflen= %d \n", $cmd->sdb->length)
                 printf("SCSI_DISPATCH_CMD: inode= %d \n", inode)
                 printf("SCSI_DISPATCH_CMD: scmd = %d \n", $cmd)
                 printf("SCSI_DISPATCH_CMD: [7]=%d [8]=%d \n", $cmd->cmnd[7],$cmd->cmnd[8])
